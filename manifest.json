@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "thepsybersleuth.audio-port-switcher",
+  "name": "Audio Port Switcher",
+  "version": "1.1.0",
+  "author": "ThePsyberSleuth",
+  "license": "MIT",
+  "description": "Drop-in replacement for the stock audio widget with device, port and card-profile switching plus per-app mixing",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "AudioWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Audio Port Switcher",
+    "description": "Volume controls, audio device selection, per-port switching, and per-app mixing",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.audio"
+  }
+}
