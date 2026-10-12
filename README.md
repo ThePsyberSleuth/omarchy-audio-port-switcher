@@ -47,6 +47,7 @@ Plugins run unsandboxed inside `omarchy-shell`. This plugin needs no privileges;
 - `manifest.json`: plugin id, version, and the `omarchy.audio` replacement metadata.
 - `AudioWidget.qml`: bar button and popup.
 - `Model.js`: device, port, profile and icon helpers.
+- `tests/`: `node --test tests/` checks the profile and port parsing.
 
 ## License
 

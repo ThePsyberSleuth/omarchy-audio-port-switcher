@@ -144,8 +144,8 @@ Panel {
   property real wheelAccumulator: 0
 
   // Ports of the current output and input, from pactl (PipeWire objects carry
-  // no port list). Rows are plain values; each update only lands when its
-  // signature changes, so an unchanged refresh never rebuilds a Repeater.
+  // no port list). Rows are plain values; an update only lands when its
+  // serialized form changes, so an unchanged refresh never rebuilds a Repeater.
   property var outputPortState: Model.parseNodePorts("", "")
   property var inputPortState: Model.parseNodePorts("", "")
   readonly property bool hasOutputPorts: outputPortState.ports.length > 1
@@ -156,23 +156,25 @@ Panel {
   // or HDMI on codecs that gate it) is still selectable. The section hides
   // unless the card offers a real alternative.
   property var cardProfiles: []
-  property string profileSignature: ""
   readonly property bool hasCardProfiles: cardProfiles.length > 1
-  // PipeWire hides node properties until the node is bound (`ready`).
-  readonly property string profileCard: {
-    var n = volumeSink || sink
-    if (!n || !n.ready || !n.properties) return ""
-    return String(n.properties["device.name"] || "")
-  }
-  onProfileCardChanged: schedulePortRefresh()
+  // The output's card, from the same pactl sink listing as its ports. Clearing
+  // the output's ports (device change, panel close) clears it too, so rows of
+  // the old card never stay clickable.
+  readonly property string profileCard: outputPortState.card
+  // Last `pactl list cards` output: the two pactl listings finish in either
+  // order, so a card change re-scopes from it at once.
+  property string cardsRaw: ""
+  onProfileCardChanged: setProfiles(Model.parseCardProfiles(cardsRaw, profileCard))
 
-  function updateProfiles(raw) {
-    var rows = Model.parseCardProfiles(raw, profileCard)
-    var sig = Model.profileSignature(rows)
-    if (sig === profileSignature) return
-    profileSignature = sig
+  function setProfiles(rows) {
+    if (JSON.stringify(rows) === JSON.stringify(cardProfiles)) return
     cardProfiles = rows
     clampCursor()
+  }
+
+  function updateProfiles(raw) {
+    cardsRaw = raw
+    setProfiles(Model.parseCardProfiles(raw, profileCard))
   }
 
   function setProfile(row) {
@@ -188,11 +190,10 @@ Panel {
       ? String(volumeSinkName || (sink && sink.name) || "")
       : String((source && source.name) || "")
     var state = Model.parseNodePorts(raw, wanted)
-    if (kind === "output") {
-      if (state.signature !== outputPortState.signature) outputPortState = state
-    } else if (state.signature !== inputPortState.signature) {
-      inputPortState = state
-    }
+    var current = kind === "output" ? outputPortState : inputPortState
+    if (JSON.stringify(state) === JSON.stringify(current)) return
+    if (kind === "output") outputPortState = state
+    else inputPortState = state
   }
 
   function refreshPorts() {
@@ -211,6 +212,7 @@ Panel {
   function clearPorts() {
     outputPortState = Model.parseNodePorts("", "")
     inputPortState = Model.parseNodePorts("", "")
+    cardsRaw = ""
   }
 
   function setPort(kind, node, port) {

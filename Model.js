@@ -273,9 +273,12 @@ function isUntypedSource(node, sourceAvailability) {
 // active, so it is unreachable from a plain sink list. This reads `pactl -f
 // json list cards` and flattens the card's profiles into selectable rows.
 //
-// Matching on the card name the current output belongs to keeps this working
-// across machines: only that card's profiles are offered.
+// Only the card the current output belongs to is offered: with no card known
+// (node not bound yet, or a virtual sink) there are no rows, rather than every
+// card's profiles mixed into one list with several "active" rows.
 function parseCardProfiles(raw, cardName) {
+  var wanted = String(cardName || "")
+  if (wanted === "") return []
   var cards
   try {
     cards = JSON.parse(String(raw || "[]"))
@@ -284,6 +287,11 @@ function parseCardProfiles(raw, cardName) {
   }
   if (!cards || !cards.length) return []
 
+  var card = null
+  for (var i = 0; i < cards.length; i++)
+    if (cards[i] && String(cards[i].name || "") === wanted) { card = cards[i]; break }
+  if (!card) return []
+
   function rank(n) {
     if (n.indexOf("pro-audio") === 0) return 2
     if (n.indexOf("output:") === 0) return 0
@@ -291,47 +299,48 @@ function parseCardProfiles(raw, cardName) {
   }
 
   var rows = []
-  for (var i = 0; i < cards.length; i++) {
-    var card = cards[i]
-    if (!card) continue
-    if (cardName && String(card.name || "") !== String(cardName)) continue
-    var profiles = card.profiles || {}
-    var active = String(card.active_profile || "")
-    var activeBase = active.split("+")[0]
-    // Stable, human order: output profiles first, raw/pro-audio last.
-    var names = Object.keys(profiles).sort(function(a, b) {
-      var ra = rank(a), rb = rank(b)
-      return ra !== rb ? ra - rb : a.localeCompare(b)
-    })
-    for (var j = 0; j < names.length; j++) {
-      var name = names[j]
-      var info = profiles[name] || {}
-      var sinks = Number(info.sinks || 0)
-      var activeHere = name === active
-      // "off" removes audio entirely and is deliberately not offered here.
-      if (name === "off") continue
-      if (!activeHere) {
-        // A profile that provides no sink is not a destination.
-        if (sinks <= 0) continue
-        // Physically absent ports (the second/third HDMI on a laptop) report
-        // sinks but availability no; switching to one produces silence.
-        if (info.available === false) continue
-        var desc = String(info.description || "")
-        // Surround variants duplicate the stereo destination for this panel.
-        if (/\b(surround|5\.1|7\.1|2\.1|4\.0)\b/i.test(desc)) continue
-        // A duplex "+input:" profile is the same output plus the mic, and a
-        // plain output whose base is already active is the same destination.
-        if (name.indexOf("+input:") !== -1) continue
-        if (name.split("+")[0] === activeBase) continue
-      }
-      rows.push({
-        card: String(card.name || ""),
-        name: name,
-        label: String(info.description || name),
-        available: info.available !== false,
-        active: activeHere
-      })
+  var profiles = card.profiles || {}
+  var active = String(card.active_profile || "")
+  var activeBase = active.split("+")[0]
+  // The active profile's "+input:..." part, kept when switching outputs so the
+  // mic survives instead of a second card teardown to restore it.
+  var inputSuffix = active.indexOf("+") !== -1 ? active.slice(active.indexOf("+")) : ""
+  // Stable, human order: output profiles first, raw/pro-audio last.
+  var names = Object.keys(profiles).sort(function(a, b) {
+    var ra = rank(a), rb = rank(b)
+    return ra !== rb ? ra - rb : a.localeCompare(b)
+  })
+  for (var j = 0; j < names.length; j++) {
+    var name = names[j]
+    var info = profiles[name] || {}
+    var activeHere = name === active
+    // "off" removes audio entirely and is deliberately not offered here.
+    if (name === "off") continue
+    if (!activeHere) {
+      // A profile that provides no sink is not a destination.
+      if (Number(info.sinks || 0) <= 0) continue
+      // Physically absent ports (the second/third HDMI on a laptop) report
+      // sinks but availability no; switching to one produces silence.
+      if (info.available === false) continue
+      // Surround variants duplicate the stereo destination for this panel.
+      if (/\b(surround|5\.1|7\.1|2\.1|4\.0)\b/i.test(String(info.description || ""))) continue
+      // A duplex "+input:" profile is the same output plus the mic, and a
+      // plain output whose base is already active is the same destination.
+      if (name.indexOf("+input:") !== -1) continue
+      if (name.split("+")[0] === activeBase) continue
     }
+    var target = name
+    if (!activeHere && inputSuffix) {
+      var duplex = profiles[name + inputSuffix]
+      if (duplex && duplex.available !== false) target = name + inputSuffix
+    }
+    rows.push({
+      card: wanted,
+      name: target,
+      label: String(info.description || name),
+      available: info.available !== false,
+      active: activeHere
+    })
   }
   return rows
 }
@@ -346,8 +355,10 @@ function profileRowLabel(row) {
 // Ports PulseAudio reports "not available" (speakers while headphones occupy
 // the jack, an unplugged line out) are left out unless active: selecting one
 // only produces silence. Rows are plain values, never PipeWire objects.
+// `card` is the owning card's name: pactl synthesizes device.name, which the
+// PipeWire node itself does not carry.
 function parseNodePorts(raw, nodeName) {
-  var empty = { node: "", active: "", ports: [], signature: "" }
+  var empty = { node: "", card: "", active: "", ports: [] }
   var wanted = String(nodeName || "")
   if (wanted === "") return empty
   var nodes
@@ -364,25 +375,17 @@ function parseNodePorts(raw, nodeName) {
     var active = String(data.active_port || "")
     var list = data.ports || []
     var ports = []
-    var signature = wanted + "#" + active
     for (var j = 0; j < list.length; j++) {
       var port = list[j]
       if (!port || !port.name) continue
       var name = String(port.name)
       if (port.availability === "not available" && name !== active) continue
       ports.push({ name: name, description: String(port.description || name) })
-      signature += "|" + name
     }
-    return { node: wanted, active: active, ports: ports, signature: signature }
+    var props = data.properties || {}
+    return { node: wanted, card: String(props["device.name"] || ""), active: active, ports: ports }
   }
   return empty
-}
-
-function profileSignature(rows) {
-  var sig = ""
-  for (var i = 0; i < rows.length; i++)
-    sig += rows[i].name + "|" + (rows[i].active ? 1 : 0) + "|" + (rows[i].available ? 1 : 0) + ";"
-  return sig
 }
 
 if (typeof module !== "undefined") {
@@ -414,7 +417,6 @@ if (typeof module !== "undefined") {
     isUntypedSource: isUntypedSource,
     parseCardProfiles: parseCardProfiles,
     profileRowLabel: profileRowLabel,
-    parseNodePorts: parseNodePorts,
-    profileSignature: profileSignature
+    parseNodePorts: parseNodePorts
   }
 }
