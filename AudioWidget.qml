@@ -826,7 +826,16 @@ Panel {
     id: audioEvents
     command: ["pactl", "subscribe"]
     environment: ({ LC_ALL: "C" })
-    running: root.opened
+    running: false
+    property real startedAt: 0
+    property int quickExits: 0
+    onRunningChanged: if (running) startedAt = Date.now()
+    // pactl exits when pipewire-pulse restarts; start it again while the panel
+    // is open, unless it keeps dying at once (no pipewire-pulse at all).
+    onExited: {
+      quickExits = Date.now() - startedAt < 1000 ? quickExits + 1 : 0
+      if (root.opened && quickExits < 5) resubscribe.start()
+    }
     stdout: SplitParser {
       onRead: function(line) {
         var text = String(line)
@@ -834,6 +843,24 @@ Panel {
             || text.indexOf(" on source #") !== -1)
           root.schedulePortRefresh()
       }
+    }
+  }
+
+  Connections {
+    target: root
+    function onOpenedChanged() {
+      resubscribe.stop()
+      audioEvents.quickExits = 0
+      audioEvents.running = root.opened
+    }
+  }
+
+  Timer {
+    id: resubscribe
+    interval: 2000
+    onTriggered: if (root.opened && !audioEvents.running) {
+      audioEvents.running = true
+      root.schedulePortRefresh()
     }
   }
 
