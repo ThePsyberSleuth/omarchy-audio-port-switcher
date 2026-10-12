@@ -5,8 +5,8 @@ import Quickshell.Io
 import Quickshell.Services.Mpris
 import Quickshell.Services.Pipewire
 import qs.Ui
-import qs.Commons as Commons
 import qs.Commons
+import qs.Commons as Commons
 import "Model.js" as Model
 
 Panel {
@@ -21,11 +21,25 @@ Panel {
   readonly property var mediaService: bar?.shell?.firstPartyServiceFor("omarchy.media")
   readonly property var activeMediaPlayer: mediaService ? mediaService.activePlayer : null
 
+  // Nodes of a platform's audio processing, which are neither devices nor apps,
+  // stay out of every list (AudioNodes.platformHides). Most machines have none.
+  readonly property var nodeNames: {
+    var names = []
+    for (var i = 0; i < nodes.length; i++)
+      if (nodes[i] && nodes[i].name) names.push(String(nodes[i].name))
+    return names
+  }
+
+  function platformHides(node) {
+    return !!node && AudioNodes.platformHides(node.name, nodeNames)
+  }
+
   readonly property var candidateSinks: {
     var list = []
     for (var i = 0; i < nodes.length; i++) {
       var n = nodes[i]
-      if (n && n.isSink && !n.isStream) list.push(n)
+      if (!n || !n.isSink || n.isStream || platformHides(n)) continue
+      list.push(n)
     }
     return list
   }
@@ -34,11 +48,11 @@ Panel {
     var list = []
     for (var i = 0; i < nodes.length; i++) {
       var n = nodes[i]
-      if (n && !n.isSink && !n.isStream && isAudioSource(n)) {
-        var name = n.name || ""
-        if (name === "quickshell") continue
-        list.push(n)
-      }
+      if (!n || n.isSink || n.isStream) continue
+      if (!isAudioSource(n) && !Model.isUntypedSource(n, sourceAvailability)) continue
+      var name = n.name || ""
+      if (name === "quickshell" || platformHides(n)) continue
+      list.push(n)
     }
     return list
   }
@@ -51,6 +65,7 @@ Panel {
       // A tuning's output is a playback stream too, but it is the processing
       // itself rather than an application, so it does not belong in the list.
       if (String(n.name || "").indexOf("omarchy_speaker_tuning") === 0) continue
+      if (platformHides(n)) continue
       list.push(n)
     }
     return list
@@ -58,6 +73,7 @@ Panel {
 
   property var sinkAvailability: ({})
   property bool sinkAvailabilityLoaded: false
+  property var sourceAvailability: ({})
 
   // Identify true playback streams without reading node.properties here:
   // PwNode.properties is invalid until the node is bound, and reading it while
@@ -101,11 +117,13 @@ Panel {
     return list
   }
 
-  // Feed Repeaters with panel-local snapshots instead of the live PipeWire
-  // model. PipeWire can remove nodes while Quickshell is dispatching the
-  // removal signal; rebuilding a Repeater from that signal path has crashed
-  // in Quickshell's PipeWire service. The snapshot timer lets that mutation
-  // settle first, and closed panels keep their repeaters detached entirely.
+  // Feed Repeaters with panel-local snapshots of primitives instead of the live
+  // PipeWire model. PipeWire can remove nodes while Quickshell is dispatching
+  // the removal signal, and a row still holding the PwNode is a QObject Qt
+  // dereferences without a null check, which segfaults the shell. Rows carry id
+  // and name only; every delegate resolves its own node through nodeFor(). The
+  // snapshot timer lets the mutation settle first, and closed panels keep their
+  // repeaters detached entirely.
   property var displayAudioSinks: []
   property var displayAudioSources: []
   property var displayAudioStreams: []
@@ -124,109 +142,75 @@ Panel {
 
   // Carry sub-notch touchpad deltas between wheel events.
   property real wheelAccumulator: 0
-  property string outputPortNode: ""
-  property string outputActivePort: ""
-  property var outputPorts: []
-  property string inputPortNode: ""
-  property string inputActivePort: ""
-  property var inputPorts: []
 
-  // Card profiles (mutual-exclusion groups). Rows come from `pactl list cards`
-  // so an output that only exists under another profile (DisplayPort/HDMI on
-  // codecs that gate it) is still selectable. Empty on machines whose single
-  // card exposes one usable output profile, in which case the section hides.
+  // Ports of the current output and input, from pactl (PipeWire objects carry
+  // no port list). Rows are plain values; each update only lands when its
+  // signature changes, so an unchanged refresh never rebuilds a Repeater.
+  property var outputPortState: Model.parseNodePorts("", "")
+  property var inputPortState: Model.parseNodePorts("", "")
+  readonly property bool hasOutputPorts: outputPortState.ports.length > 1
+  readonly property bool hasInputPorts: inputPortState.ports.length > 1
+
+  // Card profiles (mutual-exclusion groups) of the card that owns the current
+  // output, so an output that only exists under another profile (DisplayPort
+  // or HDMI on codecs that gate it) is still selectable. The section hides
+  // unless the card offers a real alternative.
   property var cardProfiles: []
-  // Signature of the last parsed profile list; guards against reassigning an
-  // equal array (which would churn every bound Repeater).
   property string profileSignature: ""
-  // The ALSA card that owns the current output, so only *its* profiles are
-  // offered. Falls back to every card when the sink has not bound its
-  // properties yet (PipeWire hides them until `ready`).
+  readonly property bool hasCardProfiles: cardProfiles.length > 1
+  // PipeWire hides node properties until the node is bound (`ready`).
   readonly property string profileCard: {
     var n = volumeSink || sink
     if (!n || !n.ready || !n.properties) return ""
     return String(n.properties["device.name"] || "")
   }
-
-  function profileLabel(row) {
-    return Model.profileRowLabel(row)
-  }
+  onProfileCardChanged: schedulePortRefresh()
 
   function updateProfiles(raw) {
     var rows = Model.parseCardProfiles(raw, profileCard)
-    // Only reassign when the list actually changed. Assigning an equal-but-new
-    // array makes every bound Repeater regenerate; under Qt 6.11 that churn
-    // has been observed to crash the JS engine, so keep the reference stable.
-    var sig = ""
-    for (var i = 0; i < rows.length; i++)
-      sig += rows[i].name + "|" + (rows[i].active ? 1 : 0) + "|" + (rows[i].available ? 1 : 0) + ";"
-    if (sig === root.profileSignature) return
-    root.profileSignature = sig
+    var sig = Model.profileSignature(rows)
+    if (sig === profileSignature) return
+    profileSignature = sig
     cardProfiles = rows
-  }
-
-  function refreshProfiles() {
-    if (!profilesProc.running) profilesProc.running = true
+    clampCursor()
   }
 
   function setProfile(row) {
-    if (!row || !row.card || !row.name) return
-    if (row.active) return
+    if (!row || !row.card || !row.name || row.active) return
     Quickshell.execDetached(["pactl", "set-card-profile", String(row.card), String(row.name)])
-    // Streams must follow the new default sink; the profile swap recreates
-    // sinks, so give WirePlumber a beat before re-resolving.
+    // The swap recreates the card's nodes; let WirePlumber settle before the
+    // DSP-sink lookup runs again. pactl events refresh the rows themselves.
     profileSwitchTimer.restart()
-    refreshProfiles()
   }
 
-  // Only show the section when there is a real alternative: more than one
-  // output-capable profile, or an available one that is not active.
-  readonly property bool hasCardProfiles: cardProfiles.length > 1
-
   function updatePorts(kind, raw) {
-    try {
-      var nodes = JSON.parse(String(raw || "[]"))
-      var wanted = kind === "output"
-        ? String(volumeSinkName || (sink && sink.name) || "")
-        : String((source && source.name) || "")
-      var data = null
-      for (var i = 0; i < nodes.length; i++) {
-        if (String(nodes[i].name || "") === wanted) { data = nodes[i]; break }
-      }
-      if (kind === "output") {
-        outputPortNode = data ? wanted : ""
-        outputActivePort = data ? String(data.active_port || "") : ""
-        outputPorts = data ? (data.ports || []) : []
-      } else {
-        inputPortNode = data ? wanted : ""
-        inputActivePort = data ? String(data.active_port || "") : ""
-        inputPorts = data ? (data.ports || []) : []
-      }
-    } catch (e) {
-      console.warn("Audio port query failed:", e)
+    var wanted = kind === "output"
+      ? String(volumeSinkName || (sink && sink.name) || "")
+      : String((source && source.name) || "")
+    var state = Model.parseNodePorts(raw, wanted)
+    if (kind === "output") {
+      if (state.signature !== outputPortState.signature) outputPortState = state
+    } else if (state.signature !== inputPortState.signature) {
+      inputPortState = state
     }
   }
 
   function refreshPorts() {
+    if (!opened) return
     if (!outputPortsProc.running) outputPortsProc.running = true
     if (!inputPortsProc.running) inputPortsProc.running = true
-    root.refreshProfiles()
+    if (!profilesProc.running) profilesProc.running = true
   }
+
+  // Coalesces bursts (a profile switch emits dozens of pactl events) into one
+  // refresh once they stop.
   function schedulePortRefresh() {
-    if (!opened) return
-    portRefreshTimer.restart()
+    if (opened) portRefreshTimer.restart()
   }
 
-  function clearOutputPorts() {
-    outputPortNode = ""
-    outputActivePort = ""
-    outputPorts = []
-  }
-
-  function clearInputPorts() {
-    inputPortNode = ""
-    inputActivePort = ""
-    inputPorts = []
+  function clearPorts() {
+    outputPortState = Model.parseNodePorts("", "")
+    inputPortState = Model.parseNodePorts("", "")
   }
 
   function setPort(kind, node, port) {
@@ -237,7 +221,6 @@ Panel {
       String(node),
       String(port)
     ])
-    portRefreshTimer.restart()
   }
 
   readonly property var volumeSink: {
@@ -251,17 +234,19 @@ Panel {
     return sink
   }
 
-  // Device/default changes invalidate the old port rows immediately. Refresh
-  // after PipeWire settles so hotplug removal cannot leave stale controls.
+  // Re-resolve whenever the selected output changes; the timer below is only a
+  // safety net for the tuning being applied or removed underneath us. The old
+  // device's port rows go at once, so hotplug never leaves stale controls.
   onSinkChanged: {
-    clearOutputPorts()
+    outputPortState = Model.parseNodePorts("", "")
     resolveVolumeSink()
     schedulePortRefresh()
   }
   onSourceChanged: {
-    clearInputPorts()
+    inputPortState = Model.parseNodePorts("", "")
     schedulePortRefresh()
   }
+  onVolumeSinkNameChanged: schedulePortRefresh()
 
   function resolveVolumeSink() {
     if (!volumeSinkProc.running) volumeSinkProc.running = true
@@ -269,8 +254,15 @@ Panel {
 
   readonly property real outputVolume: volumeSink && volumeSink.audio ? volumeSink.audio.volume : 0
   readonly property bool outputMuted: volumeSink && volumeSink.audio ? volumeSink.audio.muted : false
-  readonly property real inputVolume: source && source.audio ? source.audio.volume : 0
-  readonly property bool inputMuted: source && source.audio ? source.audio.muted : false
+  // A virtual source is untyped in Quickshell (see Model.isUntypedSource), so
+  // its volume and mute go through wpctl (UntypedInput), and the panel shows no
+  // level meter for it: Quickshell's peak monitor takes typed nodes only.
+  readonly property bool inputViaWpctl: UntypedInput.active
+  readonly property bool inputLevelKnown: !inputViaWpctl || UntypedInput.known
+  readonly property real inputVolume: inputViaWpctl ? UntypedInput.volume : (source && source.audio ? source.audio.volume : 0)
+  readonly property bool inputMuted: inputViaWpctl ? UntypedInput.muted : (source && source.audio ? source.audio.muted : false)
+  readonly property var inputPeakNode: inputViaWpctl ? null : source
+  readonly property bool inputLevelShown: !!inputPeakNode
 
   onRawAudioSinksChanged: if (rawAudioSinks.length > 0) cachedAudioSinks = rawAudioSinks
   onRawAudioSourcesChanged: if (rawAudioSources.length > 0) cachedAudioSources = rawAudioSources
@@ -296,7 +288,7 @@ Panel {
   // would otherwise report "input unmuted" forever, leaving the hero switch
   // able to mute but never to unmute.
   readonly property bool hasOutput: !!(volumeSink && volumeSink.audio)
-  readonly property bool hasInput: !!(source && source.audio)
+  readonly property bool hasInput: !!(source && source.audio) || (inputViaWpctl && UntypedInput.known)
   readonly property bool anyAudible: (hasOutput && !outputMuted) || (hasInput && !inputMuted)
   readonly property string toggleHint: anyAudible ? "Mute" : "Unmute"
 
@@ -309,7 +301,7 @@ Panel {
 
   function sectionCount(section) {
     if (section === "output") return displayAudioSinks.length
-    if (section === "profiles") return root.hasCardProfiles ? cardProfiles.length : 0
+    if (section === "profiles") return hasCardProfiles ? cardProfiles.length : 0
     if (section === "input") return displayAudioSources.length
     if (section === "streams") return displayAudioStreams.length
     return 0
@@ -317,7 +309,7 @@ Panel {
 
   function sectionVisible(section) {
     if (section === "output") return true
-    if (section === "profiles") return root.hasCardProfiles
+    if (section === "profiles") return hasCardProfiles
     if (section === "input") return displayAudioSources.length > 0 || !!source
     if (section === "streams") return displayAudioStreams.length > 0
     return false
@@ -408,7 +400,7 @@ Panel {
       return
     }
     if (focusSection === "streams" && selectedIndex >= 0 && selectedIndex < displayAudioStreams.length) {
-      var s = displayAudioStreams[selectedIndex]
+      var s = nodeFor(displayAudioStreams[selectedIndex])
       if (s && s.audio) s.audio.volume = Math.max(0, Math.min(1.5, s.audio.volume + delta))
     }
   }
@@ -418,23 +410,22 @@ Panel {
     if (focusSection === "header") { toggleAllMuted(); return }
     if (focusSection === "output") {
       if (selectedIndex === -1) { toggleOutputMute(); return }
-      var sink = displayAudioSinks[selectedIndex]
+      var sink = nodeFor(displayAudioSinks[selectedIndex])
       if (sink) setDefaultSink(sink)
       return
     }
-    if (focusSection === "profiles" && selectedIndex >= 0) {
-      var prof = root.cardProfiles[selectedIndex]
-      if (prof) setProfile(prof)
+    if (focusSection === "profiles") {
+      if (selectedIndex >= 0) setProfile(cardProfiles[selectedIndex])
       return
     }
     if (focusSection === "input") {
       if (selectedIndex === -1) { toggleInputMute(); return }
-      var src = displayAudioSources[selectedIndex]
+      var src = nodeFor(displayAudioSources[selectedIndex])
       if (src) setDefaultSource(src)
       return
     }
     if (focusSection === "streams" && selectedIndex >= 0) {
-      var st = displayAudioStreams[selectedIndex]
+      var st = nodeFor(displayAudioStreams[selectedIndex])
       if (st && st.audio) st.audio.muted = !st.audio.muted
     }
   }
@@ -449,32 +440,37 @@ Panel {
       Qt.callLater(resetScroll)
     } else {
       clearDisplayAudioModels()
-      clearOutputPorts()
-      clearInputPorts()
+      portRefreshTimer.stop()
+      clearPorts()
     }
   }
 
-  // Clamp / repair the cursor and refresh pactl-backed ports whenever the
-  // PipeWire device snapshots change underneath the open panel.
-  onAudioSinksChanged: {
-    scheduleDisplayAudioModelRefresh()
-    schedulePortRefresh()
-  }
-  onAudioSourcesChanged: {
-    scheduleDisplayAudioModelRefresh()
-    schedulePortRefresh()
-  }
+  // Clamp / repair the cursor whenever any list refreshes underneath us.
+  onAudioSinksChanged: scheduleDisplayAudioModelRefresh()
+  onAudioSourcesChanged: scheduleDisplayAudioModelRefresh()
   onAudioStreamsChanged: scheduleDisplayAudioModelRefresh()
 
-  function listSnapshot(list) {
-    return Model.listSnapshot(list, nodes)
+  function rowSnapshot(list) {
+    return Model.rowSnapshot(list)
+  }
+
+  // A row that outlives its node resolves to null, or to a node PipeWire recreated
+  // under the same id and name; every binding below guards for null, and a row
+  // that never held the node cannot dangle.
+  function nodeFor(row) {
+    if (!row) return null
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i]
+      if (n && n.id === row.id && String(n.name || "") === row.name) return n
+    }
+    return null
   }
 
   function refreshDisplayAudioModels() {
     if (!opened) return
-    displayAudioSinks = listSnapshot(audioSinks)
-    displayAudioSources = listSnapshot(audioSources)
-    displayAudioStreams = listSnapshot(audioStreams)
+    displayAudioSinks = rowSnapshot(audioSinks)
+    displayAudioSources = rowSnapshot(audioSources)
+    displayAudioStreams = rowSnapshot(audioStreams)
     clampCursor()
   }
 
@@ -554,7 +550,7 @@ Panel {
   }
 
   function inputIcon() {
-    if (!source || !source.audio) return "󰍭"
+    if (!hasInput) return "󰍭"
     return inputMuted ? "󰍭" : "󰍬"
   }
 
@@ -572,9 +568,6 @@ Panel {
     return volume
   }
 
-  // In-process, like the stock Audio widget: the shell lets a clone of
-  // omarchy.audio summon omarchy.osd, so no qs ipc spawn and no dependence on
-  // which OMARCHY_PATH the caller's environment happens to carry.
   function showVolumeOsd(volume) {
     if (!bar || !bar.shell) return
     bar.shell.summon("omarchy.osd", JSON.stringify({
@@ -584,6 +577,10 @@ Panel {
   }
 
   function setInputVolume(v) {
+    if (inputViaWpctl) {
+      UntypedInput.setVolume(v)
+      return
+    }
     if (!source || !source.audio) return
     source.audio.volume = Math.max(0, Math.min(1, v))
   }
@@ -593,7 +590,10 @@ Panel {
   }
 
   function toggleInputMute() {
-    if (source && source.audio) source.audio.muted = !source.audio.muted
+    if (inputViaWpctl) {
+      if (UntypedInput.known) UntypedInput.setMuted(!UntypedInput.muted)
+    }
+    else if (source && source.audio) source.audio.muted = !source.audio.muted
   }
 
   // The hero switch is the whole panel's on/off, so it carries both channels
@@ -602,11 +602,12 @@ Panel {
   function toggleAllMuted() {
     var mute = anyAudible
     if (hasOutput) volumeSink.audio.muted = mute
-    if (hasInput) source.audio.muted = mute
+    if (hasInput && inputViaWpctl) UntypedInput.setMuted(mute)
+    else if (hasInput) source.audio.muted = mute
   }
 
   function setDefaultSink(node) {
-    if (!node || nodes.indexOf(node) === -1) return
+    if (!node) return
     Pipewire.preferredDefaultAudioSink = node
     if (node.id !== undefined && node.name) {
       Quickshell.execDetached([
@@ -618,8 +619,9 @@ Panel {
   }
 
   function setDefaultSource(node) {
-    if (!node || nodes.indexOf(node) === -1) return
-    Pipewire.preferredDefaultAudioSource = node
+    if (!node) return
+    // Quickshell refuses an untyped node; the command below still selects it.
+    if (node.audio) Pipewire.preferredDefaultAudioSource = node
     if (node.id !== undefined && node.name) {
       Quickshell.execDetached([
         "omarchy-audio-input-set-default",
@@ -704,15 +706,18 @@ Panel {
     // Spotify exposes its PipeWire stream as "audio-src". For generic stream
     // names, use the one MPRIS player not already represented by another audio
     // stream (e.g. Chromium, or ALSA apps like cliamp).
-    return Model.unmatchedMprisStreamLabel(label, mprisPlayers, displayAudioStreams)
+    return Model.unmatchedMprisStreamLabel(label, mprisPlayers, audioStreams)
   }
 
+  // These read the other streams' node properties, so they take the live list --
+  // displayAudioStreams carries primitives now, and resolving each row back
+  // would only rebuild what audioStreams already is.
   function streamLabel(node) {
-    return Model.streamLabel(node, mprisPlayers, displayAudioStreams)
+    return Model.streamLabel(node, mprisPlayers, audioStreams)
   }
 
   function streamRepresentsPlayer(node, player) {
-    return Model.streamRepresentsPlayer(node, player, mprisPlayers, displayAudioStreams)
+    return Model.streamRepresentsPlayer(node, player, mprisPlayers, audioStreams)
   }
 
   implicitWidth: button.implicitWidth
@@ -724,8 +729,8 @@ Panel {
 
   PwNodePeakMonitor {
     id: inputPeakMonitor
-    node: root.source
-    enabled: root.opened && !!root.source
+    node: root.inputPeakNode
+    enabled: root.opened && !!root.inputPeakNode
   }
 
   Process {
@@ -738,6 +743,15 @@ Panel {
   }
 
   Process {
+    id: sourceAvailabilityProc
+    command: ["omarchy-audio-sink-availability", "sources"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.sourceAvailability = Model.parseSinkAvailability(text)
+    }
+  }
+
+  Process {
     id: volumeSinkProc
     command: ["omarchy-audio-output-sink"]
     stdout: StdioCollector {
@@ -745,6 +759,36 @@ Panel {
       onStreamFinished: root.volumeSinkName = String(text).trim()
     }
   }
+
+  Timer {
+    interval: 5000
+    running: root.opened
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: {
+      if (!sinkAvailabilityProc.running) sinkAvailabilityProc.running = true
+      if (!sourceAvailabilityProc.running) sourceAvailabilityProc.running = true
+    }
+  }
+
+  // Runs whether or not the panel is open: the bar shows and scrolls the output
+  // volume too, so an unresolved sink there would read and change the virtual
+  // tuning sink instead of the speakers.
+  Timer {
+    interval: 15000
+    running: true
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.resolveVolumeSink()
+  }
+
+  Timer {
+    id: audioModelRefreshTimer
+    interval: 75
+    repeat: false
+    onTriggered: root.refreshDisplayAudioModels()
+  }
+
   Process {
     id: outputPortsProc
     command: ["pactl", "-f", "json", "list", "sinks"]
@@ -772,54 +816,39 @@ Panel {
     }
   }
 
-  Timer {
-    id: profileSwitchTimer
-    interval: 400
-    repeat: false
-    onTriggered: {
-      root.resolveVolumeSink()
-      root.refreshPorts()
+  // Ports, profiles and jack availability change on card, sink and source
+  // events, so the open panel follows those instead of polling. A port switch
+  // emits its card event before pactl reports the new active port; the device
+  // event that settles it can land later, so every sink and source event
+  // counts. Volume changes emit these too; the debounce turns a slider drag
+  // into one refresh. Read in the C locale: pactl translates its event lines.
+  Process {
+    id: audioEvents
+    command: ["pactl", "subscribe"]
+    environment: ({ LC_ALL: "C" })
+    running: root.opened
+    stdout: SplitParser {
+      onRead: function(line) {
+        var text = String(line)
+        if (text.indexOf(" on card #") !== -1 || text.indexOf(" on sink #") !== -1
+            || text.indexOf(" on source #") !== -1)
+          root.schedulePortRefresh()
+      }
     }
   }
 
   Timer {
-    interval: 3000
-    running: root.opened
-    repeat: true
-    onTriggered: root.refreshPorts()
-  }
-
-  Timer {
     id: portRefreshTimer
-    interval: 150
+    interval: 200
     repeat: false
     onTriggered: root.refreshPorts()
   }
 
   Timer {
-    interval: 5000
-    running: root.opened
-    repeat: true
-    triggeredOnStart: true
-    onTriggered: if (!sinkAvailabilityProc.running) sinkAvailabilityProc.running = true
-  }
-
-  // Runs whether or not the panel is open: the bar shows and scrolls the output
-  // volume too, so an unresolved sink there would read and change the virtual
-  // tuning sink instead of the speakers.
-  Timer {
-    interval: 15000
-    running: true
-    repeat: true
-    triggeredOnStart: true
-    onTriggered: root.resolveVolumeSink()
-  }
-
-  Timer {
-    id: audioModelRefreshTimer
-    interval: 75
+    id: profileSwitchTimer
+    interval: 400
     repeat: false
-    onTriggered: root.refreshDisplayAudioModels()
+    onTriggered: root.resolveVolumeSink()
   }
 
   BarIconButton {
@@ -892,7 +921,7 @@ Panel {
           if (!root.cursorActive) return
           if (root.focusSection === "streams" && root.selectedIndex >= 0
               && root.selectedIndex < root.displayAudioStreams.length) {
-            var s = root.displayAudioStreams[root.selectedIndex]
+            var s = root.nodeFor(root.displayAudioStreams[root.selectedIndex])
             if (s && s.audio) s.audio.muted = !s.audio.muted
           } else if (root.focusSection === "input") {
             root.toggleInputMute()
@@ -928,6 +957,7 @@ Panel {
             // Status only — the switch owns muting, mouse and keyboard alike.
             Text {
               id: heroIcon
+              textFormat: Text.PlainText
               text: root.outputIcon()
               color: root.bar.foreground
               font.family: root.bar.fontFamily
@@ -978,6 +1008,7 @@ Panel {
 
               Text {
                 id: heroLabel
+                textFormat: Text.PlainText
                 text: root.outputVolumeName(
                   outputSlider.dragging ? outputSlider.liveValue : root.outputVolume,
                   root.outputMuted
@@ -1017,6 +1048,7 @@ Panel {
 
               Text {
                 id: outputPercent
+                textFormat: Text.PlainText
                 text: Math.round((outputSlider.dragging ? outputSlider.liveValue : root.outputVolume) * 100) + "%"
                 color: Qt.darker(root.bar.foreground, 1.4)
                 font.family: root.bar.fontFamily
@@ -1071,20 +1103,21 @@ Panel {
                 required property var modelData
                 required property int index
                 width: panelColumn.width
-                node: modelData
+                node: root.nodeFor(modelData)
                 rowIndex: index
               }
             }
+
             Repeater {
-              model: root.outputPorts.length > 1 ? root.outputPorts : []
+              model: root.hasOutputPorts ? root.outputPortState.ports : []
 
               PortRow {
                 required property var modelData
                 width: panelColumn.width
                 kind: "output"
-                nodeName: root.outputPortNode
+                nodeName: root.outputPortState.node
                 port: modelData
-                activePort: root.outputActivePort
+                activePort: root.outputPortState.active
               }
             }
           }
@@ -1110,7 +1143,7 @@ Panel {
             }
 
             Repeater {
-              model: root.cardProfiles
+              model: root.hasCardProfiles ? root.cardProfiles : []
 
               ProfileRow {
                 required property var modelData
@@ -1118,7 +1151,6 @@ Panel {
                 width: panelColumn.width
                 profile: modelData
                 rowIndex: index
-                visible: root.hasCardProfiles
               }
             }
           }
@@ -1149,7 +1181,8 @@ Panel {
 
               Text {
                 id: microphonePercent
-                text: Math.round((inputSlider.dragging ? inputSlider.liveValue : root.inputVolume) * 100) + "%"
+                textFormat: Text.PlainText
+                text: root.inputLevelKnown ? Math.round((inputSlider.dragging ? inputSlider.liveValue : root.inputVolume) * 100) + "%" : "–"
                 color: Qt.darker(root.bar.foreground, 1.4)
                 font.family: root.bar.fontFamily
                 font.pixelSize: Style.font.caption
@@ -1173,9 +1206,13 @@ Panel {
 
               Column {
                 id: inputControls
-                anchors.fill: parent
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
                 anchors.leftMargin: Style.space(6)
                 anchors.rightMargin: Style.space(6)
+                // Alone, the slider centres in the row the way the output slider does.
+                anchors.topMargin: root.inputLevelShown ? 0 : Style.spacing.controlGap / 2
                 spacing: Style.space(5)
 
                 PanelSlider {
@@ -1194,6 +1231,7 @@ Panel {
                 }
 
                 Rectangle {
+                  visible: root.inputLevelShown
                   width: parent.width
                   height: Math.max(Style.space(5), Style.spacing.xs)
                   color: Util.alpha(root.bar.foreground, 0.18)
@@ -1203,7 +1241,7 @@ Panel {
                     height: parent.height
                     width: parent.width * Math.max(0, Math.min(1, inputPeakMonitor.peak))
                     color: root.bar.foreground
-                    Behavior on width { NumberAnimation { duration: 70 } }
+                    Behavior on width { NumberAnimation { duration: Style.duration(70) } }
                   }
                 }
               }
@@ -1224,20 +1262,21 @@ Panel {
                 required property var modelData
                 required property int index
                 width: panelColumn.width
-                node: modelData
+                node: root.nodeFor(modelData)
                 rowIndex: index
               }
             }
+
             Repeater {
-              model: root.inputPorts.length > 1 ? root.inputPorts : []
+              model: root.hasInputPorts ? root.inputPortState.ports : []
 
               PortRow {
                 required property var modelData
                 width: panelColumn.width
                 kind: "input"
-                nodeName: root.inputPortNode
+                nodeName: root.inputPortState.node
                 port: modelData
-                activePort: root.inputActivePort
+                activePort: root.inputPortState.active
               }
             }
           }
@@ -1266,7 +1305,7 @@ Panel {
                 required property var modelData
                 required property int index
                 width: panelColumn.width
-                node: modelData
+                node: root.nodeFor(modelData)
                 rowIndex: index
               }
             }
@@ -1277,6 +1316,9 @@ Panel {
   }
 
   // ---- Reusable inline components ----
+
+  // Port row under a device list: switches the current sink's or source's
+  // port (speakers, headphones, line out, internal or headset mic).
   component PortRow: CursorSurface {
     id: portRow
     required property string kind
@@ -1284,11 +1326,10 @@ Panel {
     required property var port
     required property string activePort
 
-    readonly property bool isActive: port && String(port.name) === activePort
+    readonly property bool isActive: !!port && port.name === activePort
     readonly property string icon: {
-      var name = String((port && (port.description || port.name)) || "").toLowerCase()
-      if (name.indexOf("headset") !== -1) return "󰋋"
-      if (name.indexOf("headphone") !== -1) return "󰋋"
+      var name = String((port && port.description) || "").toLowerCase()
+      if (name.indexOf("headset") !== -1 || name.indexOf("headphone") !== -1) return "󰋋"
       if (name.indexOf("speaker") !== -1) return "󰓃"
       if (name.indexOf("hdmi") !== -1 || name.indexOf("displayport") !== -1) return "󰍹"
       if (name.indexOf("line") !== -1) return "󰕾"
@@ -1309,31 +1350,34 @@ Panel {
       spacing: Style.space(8)
 
       Text {
+        textFormat: Text.PlainText
         text: portRow.icon
         color: root.bar.foreground
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.title
         width: Style.space(22)
         horizontalAlignment: Text.AlignHCenter
+        anchors.verticalCenter: parent.verticalCenter
       }
 
       Text {
         id: portLabel
-        width: parent.width - Style.space(30)
-        text: String(portRow.port.description || portRow.port.name || "Port")
+        textFormat: Text.PlainText
+        text: portRow.port ? portRow.port.description : ""
         color: root.bar.foreground
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.body
         font.bold: portRow.isActive
         elide: Text.ElideRight
+        width: parent.width - Style.space(22) - Style.space(8)
+        anchors.verticalCenter: parent.verticalCenter
       }
     }
 
     MouseArea {
       anchors.fill: parent
-      hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
-      onClicked: root.setPort(portRow.kind, portRow.nodeName, String(portRow.port.name || ""))
+      onClicked: if (!portRow.isActive) root.setPort(portRow.kind, portRow.nodeName, portRow.port.name)
     }
   }
 
@@ -1351,7 +1395,6 @@ Panel {
       if (n.indexOf("hdmi") !== -1 || n.indexOf("display") !== -1) return "󰍹"
       if (n.indexOf("analog") !== -1) return "󰓃"
       if (n.indexOf("pro-audio") !== -1) return "󰒓"
-      if (n === "off") return "󰟎"
       return "󰕾"
     }
     hasCursor: root.cursorActive && root.focusSection === "profiles" && root.selectedIndex === rowIndex
@@ -1371,6 +1414,7 @@ Panel {
       spacing: Style.space(8)
 
       Text {
+        textFormat: Text.PlainText
         text: profileRow.icon
         color: root.bar.foreground
         font.family: root.bar.fontFamily
@@ -1378,20 +1422,19 @@ Panel {
         width: Style.space(22)
         horizontalAlignment: Text.AlignHCenter
         anchors.verticalCenter: parent.verticalCenter
-        opacity: profileRow.isActive ? 1.0 : 0.85
       }
 
       Text {
         id: profileLabel
-        text: root.profileLabel(profileRow.profile)
+        textFormat: Text.PlainText
+        text: Model.profileRowLabel(profileRow.profile)
         color: root.bar.foreground
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.body
         font.bold: profileRow.isActive
         elide: Text.ElideRight
-        width: parent.width - Style.space(30)
+        width: parent.width - Style.space(22) - Style.space(8)
         anchors.verticalCenter: parent.verticalCenter
-        opacity: (profileRow.profile && profileRow.profile.available === false) ? 0.45 : 1.0
       }
     }
 
@@ -1407,7 +1450,6 @@ Panel {
       onClicked: root.setProfile(profileRow.profile)
     }
   }
-
 
   // Output device row — cursor target inside the "output" section. Mouse
   // hover updates the panel cursor at the root; visuals come entirely
@@ -1436,6 +1478,7 @@ Panel {
       spacing: Style.space(8)
 
       Text {
+        textFormat: Text.PlainText
         text: root.sinkGlyph(sinkRow.node)
         color: root.bar.foreground
         font.family: root.bar.fontFamily
@@ -1446,6 +1489,7 @@ Panel {
       }
 
       Text {
+        textFormat: Text.PlainText
         text: root.nodeLabel(sinkRow.node)
         color: root.bar.foreground
         font.family: root.bar.fontFamily
@@ -1495,6 +1539,7 @@ Panel {
       spacing: Style.space(8)
 
       Text {
+        textFormat: Text.PlainText
         text: root.sourceGlyph(sourceRow.node)
         color: root.bar.foreground
         font.family: root.bar.fontFamily
@@ -1505,6 +1550,7 @@ Panel {
       }
 
       Text {
+        textFormat: Text.PlainText
         text: root.nodeLabel(sourceRow.node)
         color: root.bar.foreground
         font.family: root.bar.fontFamily
@@ -1565,6 +1611,7 @@ Panel {
 
         Text {
           id: streamMuteIcon
+          textFormat: Text.PlainText
           text: streamRow.streamMuted ? "󰝟" : "󰕾"
           color: root.bar.foreground
           font.family: root.bar.fontFamily
@@ -1585,6 +1632,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           text: root.streamLabel(streamRow.node)
           color: root.bar.foreground
           font.family: root.bar.fontFamily
@@ -1597,6 +1645,7 @@ Panel {
 
         Text {
           id: streamPct
+          textFormat: Text.PlainText
           text: Math.round(streamRow.streamVolume * 100) + "%"
           color: Qt.darker(root.bar.foreground, 1.5)
           font.family: root.bar.fontFamily

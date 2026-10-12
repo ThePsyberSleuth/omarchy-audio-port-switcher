@@ -18,14 +18,31 @@ function isAudioSource(node) {
     || mediaClass.indexOf("Source") !== -1
 }
 
-// A PipeWire node destroyed after it was cached (a card profile switch tears
-// down every sink on the card) is still a truthy JS wrapper, but handing it to
-// a Repeater with required properties segfaults Qt in createMissingProperties.
-// Only nodes still present in the live PipeWire list are safe to display.
-function listSnapshot(list, liveNodes) {
-  if (!list || !list.filter) return []
-  var live = liveNodes || []
-  return list.filter(function(node) { return !!node && live.indexOf(node) !== -1 })
+// Project a node list to the primitive rows a Repeater model can hold. A row
+// holding the PwNode itself is a QObject that Qt dereferences without a null
+// check while it builds the delegate, and PipeWire deletes nodes outright, so a
+// graph teardown segfaults the shell. Primitives cannot dangle, which is what
+// closes that race -- not the check below, since the node usually dies after the
+// snapshot is taken. That is also why filtering the list here never worked.
+//
+// The name rides along because PipeWire reuses object ids: without it a row
+// could resolve to whatever inherited its id. PwNode.name is CONSTANT, so it
+// identifies the node it was taken from for as long as that node lives.
+function nodeRow(node) {
+  if (!node) return null
+  var id = node.id
+  if (id === undefined || id === null) return null
+  return { id: id, name: String(node.name || "") }
+}
+
+function rowSnapshot(list) {
+  var values = list && list.length ? list : []
+  var rows = []
+  for (var i = 0; i < values.length; i++) {
+    var row = nodeRow(values[i])
+    if (row) rows.push(row)
+  }
+  return rows
 }
 
 function outputVolumeName(volume, muted) {
@@ -51,93 +68,6 @@ function parseSinkAvailability(raw) {
     if (parts.length >= 2) next[parts[0]] = parts[1] !== "0"
   }
   return next
-}
-
-// A card profile is a mutual-exclusion group on an ALSA card: choosing one
-// disables the others' sinks/sources. On codecs that gate outputs behind a
-// profile (e.g. Cirrus CS8409, many SOF/SoundWire laptops), the DisplayPort
-// or HDMI sink does not exist as a PipeWire node at all until its profile is
-// active, so it is unreachable from a plain sink list. This reads `pactl -f
-// json list cards` and flattens every card's profiles into selectable rows.
-//
-// Matching on profile *name* rather than a fixed card name keeps this working
-// across machines: the caller passes the fjell card name from the sinks it can
-// see, and only that card's profiles are offered.
-function parseCardProfiles(raw, cardName) {
-  var cards
-  try {
-    cards = JSON.parse(String(raw || "[]"))
-  } catch (e) {
-    return []
-  }
-  if (!cards || !cards.length) return []
-
-  var rows = []
-  for (var i = 0; i < cards.length; i++) {
-    var card = cards[i]
-    if (!card) continue
-    if (cardName && String(card.name || "") !== String(cardName)) continue
-    var profiles = card.profiles || {}
-    var active = String(card.active_profile || "")
-    var names = Object.keys(profiles)
-    // Stable, human order: "off" last, output profiles before raw/pro-audio.
-    names.sort(function(a, b) {
-      function rank(n) {
-        if (n === "off") return 3
-        if (n.indexOf("pro-audio") === 0) return 2
-        if (n.indexOf("output:") === 0) return 0
-        return 1
-      }
-      var ra = rank(a), rb = rank(b)
-      if (ra !== rb) return ra - rb
-      return a.localeCompare(b)
-    })
-    var activeBase = String(active).split("+")[0]
-    for (var j = 0; j < names.length; j++) {
-      var name = names[j]
-      var info = profiles[name] || {}
-      var sinks = Number(info.sinks || 0)
-      var activeHere = name === active
-      // A profile that provides no sink is not a destination, unless it is the
-      // active one (which still holds the output). "off" removes audio entirely
-      // and is deliberately not offered here.
-      if (name === "off") continue
-      if (sinks <= 0 && !activeHere) continue
-      // Physically absent ports (the second/third HDMI on a laptop) report
-      // sinks but availability no; offering them would switch the card to a
-      // profile that produces silence. The active profile is always kept.
-      if (info.available === false && !activeHere) continue
-      var desc = String(info.description || "")
-      // Surround variants duplicate the stereo destination for this panel's
-      // purpose; keep them only when one is the active profile.
-      if (!activeHere && /\b(surround|5\.1|7\.1|2\.1|4\.0)\b/i.test(desc)) continue
-      // A duplex "+input:" profile is the same output plus the mic. Keep the
-      // one that is active; drop the redundant sibling, and drop a plain
-      // output whose base output is already covered by the active profile.
-      if (!activeHere && name.indexOf("+input:") !== -1) continue
-      if (!activeHere && name.split("+")[0] === activeBase) continue
-      rows.push({
-        card: String(card.name || ""),
-        name: name,
-        label: desc || name,
-        sinks: sinks,
-        sources: Number(info.sources || 0),
-        available: info.available !== false,
-        active: activeHere
-      })
-    }
-  }
-  return rows
-}
-
-// Compact label for a profile row: strip the "Digital Stereo (HDMI) Output"
-// boilerplate down to what distinguishes one output from another.
-function profileRowLabel(row) {
-  if (!row) return "Profile"
-  var name = String(row.name || "")
-  var label = String(row.label || name)
-  label = label.replace(/\s*\(HDMI \d+\)/i, "")
-  return label
 }
 
 function friendlyDeviceLabel(text) {
@@ -324,4 +254,167 @@ function streamRepresentsPlayer(node, player, players, streams) {
   var label = rawStreamLabel(node)
   if (!streamLabelIsGeneric(label)) return streamRepresentsMprisPlayer(label, playerLabel)
   return streamRepresentsMprisPlayer(streamLabel(node, players, streams), playerLabel)
+}
+
+// Quickshell types only exact media classes, so a virtual source (an
+// Audio/Source/Virtual, such as EasyEffects' or a platform's microphone
+// mapping) is a node with no PwNode.audio. PulseAudio lists it as a source, so
+// the source availability listing names it; a non-stream node it names is one.
+function isUntypedSource(node, sourceAvailability) {
+  if (!node || node.audio || node.isStream || node.isSink) return false
+  var name = String(node.name || "")
+  return name !== "" && !!sourceAvailability && Object.prototype.hasOwnProperty.call(sourceAvailability, name)
+}
+
+// A card profile is a mutual-exclusion group on an ALSA card: choosing one
+// disables the others' sinks/sources. On codecs that gate outputs behind a
+// profile (e.g. Cirrus CS8409, many SOF/SoundWire laptops), the DisplayPort
+// or HDMI sink does not exist as a PipeWire node at all until its profile is
+// active, so it is unreachable from a plain sink list. This reads `pactl -f
+// json list cards` and flattens the card's profiles into selectable rows.
+//
+// Matching on the card name the current output belongs to keeps this working
+// across machines: only that card's profiles are offered.
+function parseCardProfiles(raw, cardName) {
+  var cards
+  try {
+    cards = JSON.parse(String(raw || "[]"))
+  } catch (e) {
+    return []
+  }
+  if (!cards || !cards.length) return []
+
+  function rank(n) {
+    if (n.indexOf("pro-audio") === 0) return 2
+    if (n.indexOf("output:") === 0) return 0
+    return 1
+  }
+
+  var rows = []
+  for (var i = 0; i < cards.length; i++) {
+    var card = cards[i]
+    if (!card) continue
+    if (cardName && String(card.name || "") !== String(cardName)) continue
+    var profiles = card.profiles || {}
+    var active = String(card.active_profile || "")
+    var activeBase = active.split("+")[0]
+    // Stable, human order: output profiles first, raw/pro-audio last.
+    var names = Object.keys(profiles).sort(function(a, b) {
+      var ra = rank(a), rb = rank(b)
+      return ra !== rb ? ra - rb : a.localeCompare(b)
+    })
+    for (var j = 0; j < names.length; j++) {
+      var name = names[j]
+      var info = profiles[name] || {}
+      var sinks = Number(info.sinks || 0)
+      var activeHere = name === active
+      // "off" removes audio entirely and is deliberately not offered here.
+      if (name === "off") continue
+      if (!activeHere) {
+        // A profile that provides no sink is not a destination.
+        if (sinks <= 0) continue
+        // Physically absent ports (the second/third HDMI on a laptop) report
+        // sinks but availability no; switching to one produces silence.
+        if (info.available === false) continue
+        var desc = String(info.description || "")
+        // Surround variants duplicate the stereo destination for this panel.
+        if (/\b(surround|5\.1|7\.1|2\.1|4\.0)\b/i.test(desc)) continue
+        // A duplex "+input:" profile is the same output plus the mic, and a
+        // plain output whose base is already active is the same destination.
+        if (name.indexOf("+input:") !== -1) continue
+        if (name.split("+")[0] === activeBase) continue
+      }
+      rows.push({
+        card: String(card.name || ""),
+        name: name,
+        label: String(info.description || name),
+        available: info.available !== false,
+        active: activeHere
+      })
+    }
+  }
+  return rows
+}
+
+// Compact label for a profile row: drop the "(HDMI n)" boilerplate.
+function profileRowLabel(row) {
+  if (!row) return "Profile"
+  return String(row.label || row.name || "").replace(/\s*\(HDMI \d+\)/i, "")
+}
+
+// The ports of one sink or source from `pactl -f json list sinks|sources`.
+// Ports PulseAudio reports "not available" (speakers while headphones occupy
+// the jack, an unplugged line out) are left out unless active: selecting one
+// only produces silence. Rows are plain values, never PipeWire objects.
+function parseNodePorts(raw, nodeName) {
+  var empty = { node: "", active: "", ports: [], signature: "" }
+  var wanted = String(nodeName || "")
+  if (wanted === "") return empty
+  var nodes
+  try {
+    nodes = JSON.parse(String(raw || "[]"))
+  } catch (e) {
+    return empty
+  }
+  if (!nodes || !nodes.length) return empty
+
+  for (var i = 0; i < nodes.length; i++) {
+    var data = nodes[i]
+    if (!data || String(data.name || "") !== wanted) continue
+    var active = String(data.active_port || "")
+    var list = data.ports || []
+    var ports = []
+    var signature = wanted + "#" + active
+    for (var j = 0; j < list.length; j++) {
+      var port = list[j]
+      if (!port || !port.name) continue
+      var name = String(port.name)
+      if (port.availability === "not available" && name !== active) continue
+      ports.push({ name: name, description: String(port.description || name) })
+      signature += "|" + name
+    }
+    return { node: wanted, active: active, ports: ports, signature: signature }
+  }
+  return empty
+}
+
+function profileSignature(rows) {
+  var sig = ""
+  for (var i = 0; i < rows.length; i++)
+    sig += rows[i].name + "|" + (rows[i].active ? 1 : 0) + "|" + (rows[i].available ? 1 : 0) + ";"
+  return sig
+}
+
+if (typeof module !== "undefined") {
+  module.exports = {
+    isPlaybackStream: isPlaybackStream,
+    isAudioSource: isAudioSource,
+    nodeRow: nodeRow,
+    rowSnapshot: rowSnapshot,
+    outputVolumeName: outputVolumeName,
+    parseSinkAvailability: parseSinkAvailability,
+    friendlyDeviceLabel: friendlyDeviceLabel,
+    nodeProps: nodeProps,
+    nodeLabel: nodeLabel,
+    isHeadphones: isHeadphones,
+    sinkGlyph: sinkGlyph,
+    sourceGlyph: sourceGlyph,
+    friendlyStreamLabel: friendlyStreamLabel,
+    streamLabelKey: streamLabelKey,
+    streamLabelIsGeneric: streamLabelIsGeneric,
+    rawStreamLabel: rawStreamLabel,
+    mprisPlayerLabel: mprisPlayerLabel,
+    mprisPlayerIsProxy: mprisPlayerIsProxy,
+    streamRepresentsMprisPlayer: streamRepresentsMprisPlayer,
+    mprisLabelsFor: mprisLabelsFor,
+    matchingMprisStreamLabel: matchingMprisStreamLabel,
+    unmatchedMprisStreamLabel: unmatchedMprisStreamLabel,
+    streamLabel: streamLabel,
+    streamRepresentsPlayer: streamRepresentsPlayer,
+    isUntypedSource: isUntypedSource,
+    parseCardProfiles: parseCardProfiles,
+    profileRowLabel: profileRowLabel,
+    parseNodePorts: parseNodePorts,
+    profileSignature: profileSignature
+  }
 }

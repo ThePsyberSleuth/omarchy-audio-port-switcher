@@ -22,14 +22,16 @@ Removing or disabling it puts the stock audio widget back where it was.
 
 ## Requirements
 
-- Omarchy 4 (Quattro) shell. Tested on Qt 6.12; palette references use `Commons.Color`, which also works on Qt 6.11.
+- Omarchy 4 (Quattro) shell from October 2026 or later: the panel is rebased on the stock `omarchy.audio` panel and uses its `AudioNodes` and `UntypedInput` singletons. Palette references use `Commons.Color` (Qt 6.11 and 6.12).
 - Everything else ships with Omarchy: PipeWire with WirePlumber, `pactl` (from `libpulse`), and the `omarchy-audio-*` commands.
 
 ## What it does
 
 - **Output and input devices**: picks the default sink or source through Omarchy's own `omarchy-audio-output-set-default` / `omarchy-audio-input-set-default`, so volume keys and the stock switcher agree with it.
-- **Ports**: switches between the current device's ports (speakers, headphones, line out) with `pactl set-sink-port` / `set-source-port`.
+- **Ports**: switches between the current device's ports (speakers, headphones, line out, internal or headset mic) with `pactl set-sink-port` / `set-source-port`. Ports PulseAudio reports as not available (speakers while headphones occupy the jack) are left out, and the list hides when only one port remains.
 - **Card profiles**: some laptop codecs only create an HDMI or DisplayPort output after you switch the card profile. This section lists those profiles from `pactl -f json list cards` and switches with `pactl set-card-profile`. Profiles whose outputs are physically absent are left out, and the section hides itself when a card offers no real alternative.
+- Ports and profiles follow `pactl subscribe` card, sink and source events while the panel is open instead of polling, debounced so a burst (a profile switch, a slider drag) costs one refresh. The subscription stops when the panel closes.
+- Everything the stock panel does: virtual sources (EasyEffects, platform mic mappings) with volume through `wpctl`, platform audio hints that hide processing nodes, and Repeater rows that hold plain values instead of PipeWire objects, so a card profile switch tearing down nodes cannot crash the shell.
 - **Per-app mixing** and media controls through PipeWire and MPRIS.
 - Scrolling on the icon changes the volume and shows Omarchy's volume OSD.
 - The **Super+Ctrl+A** keybinding and `omarchy-shell shell toggle omarchy.audio` open this panel, because it answers on the stock `omarchy.audio` target.
